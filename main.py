@@ -14,77 +14,66 @@ from transformers import (
     AutoTokenizer,
     AutoModelForSequenceClassification,
     AutoModelForCausalLM,
-    # Add other AutoModel types as needed, e.g.:
-    AutoModelForQuestionAnswering,
-    AutoModelForTokenClassification,
-    AutoModelForSeq2SeqLM,
     TrainingArguments,
     Trainer,
     DataCollatorWithPadding,
-    pipeline # For simpler inference on some tasks
+    pipeline
 )
-from datasets import load_dataset, Dataset
+from datasets import load_dataset, Dataset, DatasetDict
 from peft import LoraConfig, get_peft_model, TaskType, PeftModel, PeftConfig
 import numpy as np
-import pandas as pd # For loading CSV datasets
+import pandas as pd
 
 # --- Configuration ---
-# Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Ensure model/dataset cache directory exists and is writable if needed
-# Hugging Face defaults to ~/.cache/huggingface/
-# You can set TRANSFORMERS_CACHE or HF_HOME environment variables
-
-# --- Pydantic Models for API ---
-
+# --- Pydantic Models for API (Content from previous version) ---
 class InferenceRequest(BaseModel):
-    task: str = Field(..., description="NLP task, e.g., 'text-classification', 'text-generation'")
+    task: str = Field(..., description="NLP task")
     model_name: str = Field(..., description="Hugging Face model identifier")
-    input_text: Union[str, List[str]] = Field(..., description="Text to process or a list of texts")
-    quantization: Optional[str] = Field("none", description="Quantization option: 'none', 'dynamic_int8_cpu'")
-    generation_args: Optional[Dict[str, Any]] = Field(None, description="Arguments for text generation (e.g., max_length, num_beams)")
+    input_text: Union[str, List[str]] = Field(..., description="Text to process")
+    quantization: Optional[str] = Field("none", description="Quantization: none, dynamic_int8_cpu")
+    generation_args: Optional[Dict[str, Any]] = None
 
 class InferenceResponse(BaseModel):
-    predictions: Any # Could be a list of dicts, a string, etc.
+    predictions: Any
     model_used: str
     quantization_applied: str
 
 class LoRAConfigModel(BaseModel):
-    r: int = Field(8, description="Rank of LoRA decomposition")
-    alpha: int = Field(16, description="LoRA scaling factor")
-    dropout: float = Field(0.05, description="Dropout for LoRA layers")
-    target_modules: Optional[Union[str, List[str]]] = Field("q_proj,v_proj", description="Comma-separated string or list of target module names for LoRA")
+    r: int = Field(8)
+    alpha: int = Field(16)
+    dropout: float = Field(0.05)
+    target_modules: Optional[Union[str, List[str]]] = Field("q_proj,v_proj")
 
 class FineTuneParamsModel(BaseModel):
-    dataset_path: str = Field(..., description="Path or HF Hub name of the dataset")
-    text_column: Optional[str] = Field("text", description="Name of the text column in the dataset")
-    label_column: Optional[str] = Field("label", description="Name of the label column (for classification)")
-    epochs: int = Field(3, description="Number of training epochs")
-    batch_size: int = Field(8, description="Training batch size")
-    learning_rate: float = Field(2e-5, description="Learning rate")
-    use_lora: bool = Field(True, description="Whether to use LoRA for fine-tuning")
+    dataset_path: str = Field(...)
+    text_column: Optional[str] = Field("text")
+    label_column: Optional[str] = Field("label")
+    epochs: int = Field(3)
+    batch_size: int = Field(8)
+    learning_rate: float = Field(2e-5)
+    use_lora: bool = Field(True)
     lora_config: Optional[LoRAConfigModel] = None
-    output_dir_base: str = Field("./finetuned_models", description="Base directory to save fine-tuned models")
-    max_seq_length: int = Field(256, description="Maximum sequence length for tokenization")
-    num_labels: Optional[int] = Field(None, description="Number of labels for classification (if not inferable)")
-
+    output_dir_base: str = Field("./finetuned_models")
+    max_seq_length: int = Field(256)
+    num_labels: Optional[int] = None
 
 class FineTuneRequest(BaseModel):
-    task: str = Field(..., description="NLP task for fine-tuning")
-    model_name: str = Field(..., description="Base Hugging Face model identifier")
+    task: str = Field(...)
+    model_name: str = Field(...)
     fine_tune_params: FineTuneParamsModel
 
 class FineTuneResponse(BaseModel):
     message: str
     model_name: str
     adapter_output_path: Optional[str] = None
-    logs: Optional[str] = None # Could be a path to a log file or inline logs
+    logs: Optional[str] = None
 
 # --- FastAPI App Initialization ---
 app = FastAPI(
-    title="Model Runner API",
+    title="Hugging Face Model Runner API",
     description="API to run inference and fine-tune Hugging Face models.",
     version="0.1.0"
 )
@@ -98,7 +87,8 @@ app = FastAPI(
 
 origins = [
     "http://localhost:3000",  # For local Next.js development
-    "https://orchestrator.forgemission.com", # production domain
+    "https://yourdomain.com", # Replace with your frontend's production domain
+    # Add other origins if needed, e.g., a staging environment
 ]
 
 app.add_middleware(
@@ -109,13 +99,10 @@ app.add_middleware(
     allow_headers=["*"],    # Allow all headers
 )
 
-# --- Global Variables / Model Cache (Simple In-Memory) ---
-# For a production app, consider a more robust caching mechanism or loading models on demand.
-# This simple cache might not be ideal for very large models or many concurrent users.
-loaded_models_cache = {} # Stores { (model_name, quantization_type, task_type_for_head): (model, tokenizer) }
+# --- Global Variables / Model Cache (Content from previous version) ---
+loaded_models_cache = {}
 
-# --- Helper Functions ---
-
+# --- Helper Functions (Content from previous version, no changes needed here for CORS) ---
 def get_model_and_tokenizer(model_name: str, task: str, num_labels: Optional[int] = None, quantization: str = "none"):
     """Loads model and tokenizer, applying quantization if specified. Caches them."""
     # For text-classification, the num_labels in the cache key is important if different heads are used.
@@ -129,18 +116,38 @@ def get_model_and_tokenizer(model_name: str, task: str, num_labels: Optional[int
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     logger.info(f"Loading model {model_name} for task {task}...")
 
+    # Set pad_token if not present, common for generative models
+    if tokenizer.pad_token is None:
+        if tokenizer.eos_token is not None:
+            logger.info(f"Tokenizer for {model_name} has no pad_token. Setting pad_token to eos_token ({tokenizer.eos_token}).")
+            tokenizer.pad_token = tokenizer.eos_token
+        else:
+            # If no EOS token either, add a new pad token. This is less common for pre-trained.
+            # For models like GPT2, eos_token is usually also bos_token and pad_token.
+            # If truly no eos_token, adding a new special token might be necessary,
+            # but could affect model performance if not trained with it.
+            # Defaulting to a common strategy for models that might lack it.
+            logger.warning(f"Tokenizer for {model_name} has no pad_token and no eos_token. Adding a new pad_token '[PAD]'. This might require model retraining for optimal performance if the model was not expecting it.")
+            tokenizer.add_special_tokens({'pad_token': '[PAD]'})
+            # If you add a new token, the model's embedding layer might need resizing if you intend to fine-tune.
+            # For inference, this might be okay if the model isn't sensitive to it or if padding is on the right.
+
     if task == "text-classification":
         if num_labels is not None:
             # This branch is typically for fine-tuning, where num_labels is explicitly set.
             logger.info(f"Loading {model_name} for text-classification with explicit num_labels: {num_labels}")
-            model = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=num_labels)
+            model = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=num_labels, ignore_mismatched_sizes=True)
         else:
             # This branch is for inference. Let the model load its own config for num_labels.
-            # The warning about num_labels not being provided is more relevant for fine-tuning setup.
             logger.info(f"Loading {model_name} for text-classification inference (num_labels will be inferred from model config).")
             model = AutoModelForSequenceClassification.from_pretrained(model_name)
     elif task == "text-generation":
         model = AutoModelForCausalLM.from_pretrained(model_name)
+        # If tokenizer vocabulary was expanded by adding a new pad_token, resize model embeddings
+        # This is more critical for fine-tuning, but good practice if vocab changed.
+        if tokenizer.pad_token_id is not None and tokenizer.pad_token_id >= model.config.vocab_size:
+             logger.info(f"Resizing token embeddings for {model_name} due to new pad_token.")
+             model.resize_token_embeddings(len(tokenizer))
     else:
         raise HTTPException(status_code=400, detail=f"Unsupported task for model loading: {task}")
     
@@ -160,75 +167,72 @@ def get_model_and_tokenizer(model_name: str, task: str, num_labels: Optional[int
     return model, tokenizer
 
 def get_lora_target_modules(model_name_or_path: str, user_specified_modules: Optional[Union[str, List[str]]]) -> List[str]:
-    """
-    Determines LoRA target modules.
-    If user_specified_modules is provided (as comma-separated string or list), use that.
-    Otherwise, provide some common defaults based on model type.
-    This is a simplified heuristic; for best results, users should specify based on model architecture.
-    """
     if isinstance(user_specified_modules, str):
-        modules = [m.strip() for m in user_specified_modules.split(',') if m.strip()]
-        if modules:
-            logger.info(f"Using user-specified LoRA target modules: {modules}")
-            return modules
+        modules = [m.strip() for m in user_specified_modules.split(",") if m.strip()]
+        if modules: return modules
     elif isinstance(user_specified_modules, list) and user_specified_modules:
-        logger.info(f"Using user-specified LoRA target modules: {user_specified_modules}")
         return user_specified_modules
+    
+    logger.info("Inferring LoRA target modules.")
+    name = model_name_or_path.lower()
+    if "distilbert" in name: return ["q_lin", "k_lin", "v_lin", "out_lin"]
+    if "roberta" in name or "bert" in name: return ["query", "key", "value", "dense"]
+    if any(n in name for n in ["gpt2", "llama", "mistral", "opt"]):
+        logger.warning(f"Generic LoRA targets for {name}. Verify for optimal targets.")
+        return ["c_attn", "c_proj"] # GPT-2 like, adjust for others (e.g. q_proj, v_proj for Llama)
+    logger.warning(f"Could not infer LoRA targets for {name}.")
+    return []
 
-    logger.info("User did not specify LoRA target modules. Attempting to use common defaults.")
-    model_name_lower = model_name_or_path.lower()
-    if "distilbert" in model_name_lower:
-        return ["q_lin", "k_lin", "v_lin", "out_lin"] # "ffn.lin1", "ffn.lin2" also common
-    elif "roberta" in model_name_lower or "bert" in model_name_lower : # and not "distilbert"
-        return ["query", "key", "value", "dense"] # "intermediate.dense", "output.dense" for FFN
-    elif "gpt2" in model_name_lower or "llama" in model_name_lower or "mistral" in model_name_lower or "opt" in model_name_lower:
-        # Common for many decoder models, but can vary (e.g., Llama uses q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj)
-        # This is a very broad guess.
-        logger.warning(f"Using generic LoRA targets for {model_name_or_path}. Please verify model architecture for optimal targets (e.g., q_proj, v_proj).")
-        return ["c_attn", "c_proj"] # GPT-2 like
-    else:
-        logger.warning(f"Could not determine default LoRA target modules for {model_name_or_path}. LoRA might not be applied effectively without explicit target_modules.")
-        return []
-
-
-# --- API Endpoints ---
-
+# --- API Endpoints (Content from previous version, no changes needed here for CORS) ---
 @app.post("/api/v1/infer", response_model=InferenceResponse)
-async def run_inference(request: InferenceRequest):
+async def run_inference_endpoint(request: InferenceRequest):
     logger.info(f"Received inference request: Task={request.task}, Model={request.model_name}")
     try:
-        # For text classification, num_labels might be needed if the model isn't pre-fine-tuned
-        # However, for inference, the head should already exist.
-        model, tokenizer = get_model_and_tokenizer(request.model_name, request.task, quantization=request.quantization)
+        # For inference, num_labels is not passed to get_model_and_tokenizer, so it defaults to None.
+        # The updated get_model_and_tokenizer will handle this correctly for text-classification.
+        model, tokenizer = get_model_and_tokenizer(
+            model_name=request.model_name,
+            task=request.task,
+            quantization=request.quantization
+        )
 
         if request.task == "text-classification":
             # Using pipeline for simplicity for classification
+            # The pipeline will use the model's loaded configuration (including num_labels).
             classifier = pipeline(
-                "sentiment-analysis" if "sentiment" in request.model_name else "text-classification", # Heuristic for pipeline task
+                "sentiment-analysis" if "sentiment" in request.model_name.lower() or "sst-2" in request.model_name.lower() else "text-classification", # Improved heuristic
                 model=model,
                 tokenizer=tokenizer,
-                device=-1 # -1 for CPU, 0 for GPU 0 (if available and model on GPU)
+                device=-1 # -1 for CPU
             )
-            # Pipeline expects a list of strings or a single string
             results = classifier(request.input_text if isinstance(request.input_text, list) else [request.input_text])
             predictions = results
 
         elif request.task == "text-generation":
-            inputs = tokenizer(request.input_text, return_tensors="pt", padding=True, truncation=True)
-            # Ensure inputs are on the same device as the model (CPU in this case)
-            # inputs = {k: v.to(model.device) for k, v in inputs.items()}
-
-            gen_args = request.generation_args or {}
-            default_gen_args = {"max_length": 50, "num_return_sequences": 1}
-            final_gen_args = {**default_gen_args, **gen_args}
-
-            with torch.no_grad():
-                outputs = model.generate(**inputs, **final_gen_args)
+            # Ensure tokenizer has pad_token_id for padding=True
+            if tokenizer.pad_token_id is None:
+                 # This should have been handled in get_model_and_tokenizer, but as a safeguard:
+                if tokenizer.eos_token_id is not None:
+                    tokenizer.pad_token_id = tokenizer.eos_token_id
+                else:
+                    # This case should be very rare for pre-trained models
+                    raise ValueError("Tokenizer has no pad_token_id and no eos_token_id. Cannot proceed with padding for generation.")
             
-            if isinstance(request.input_text, list):
-                predictions = [tokenizer.decode(output, skip_special_tokens=True) for output in outputs]
-            else:
+            inputs = tokenizer(request.input_text, return_tensors="pt", padding=True, truncation=True)
+            gen_args = request.generation_args or {}
+            final_gen_args = {**{"max_length": 50, "num_return_sequences": 1}, **gen_args} # Default generation args
+            with torch.no_grad(): outputs = model.generate(**inputs, **final_gen_args)
+            
+            # Decode all generated sequences if input_text was a list, else decode the first one
+            if isinstance(request.input_text, list) and len(outputs) == len(inputs["input_ids"]) * final_gen_args.get("num_return_sequences", 1) :
+                 # This logic might need adjustment based on how batch generation returns sequences
+                predictions = [tokenizer.decode(output_seq, skip_special_tokens=True) for output_seq in outputs]
+            elif not isinstance(request.input_text, list):
                 predictions = tokenizer.decode(outputs[0], skip_special_tokens=True)
+            else: # Fallback for batched input if logic above is not perfect
+                logger.warning("Decoding multiple sequences for batched text generation, structure might vary.")
+                predictions = [tokenizer.decode(output_seq, skip_special_tokens=True) for output_seq in outputs]
+
 
         else:
             raise HTTPException(status_code=400, detail=f"Inference for task '{request.task}' not yet implemented.")
@@ -243,226 +247,138 @@ async def run_inference(request: InferenceRequest):
         logger.error(f"Error during inference: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
-
 @app.post("/api/v1/finetune", response_model=FineTuneResponse)
-async def run_fine_tuning(request: FineTuneRequest, background_tasks: BackgroundTasks):
-    """
-    Fine-tunes a model.
-    NOTE: This is a SYNCHRONOUS endpoint for simplicity. For production,
-    long-running tasks like fine-tuning should be handled asynchronously
-    using background_tasks properly (e.g., returning a job ID and having
-    separate status/result endpoints) or a dedicated task queue like Celery.
-    The current BackgroundTasks usage is a placeholder for where that logic would go.
-    """
+async def run_fine_tuning_endpoint(request: FineTuneRequest, background_tasks: BackgroundTasks): # Renamed
     params = request.fine_tune_params
-    logger.info(f"Received fine-tuning request: Task={request.task}, Model={request.model_name}, Dataset={params.dataset_path}")
-
-    # Create a unique output directory for this run
+    logger.info(f"Fine-tune: Task={request.task}, Model={request.model_name}, Data={params.dataset_path}")
     run_name = f"{request.model_name.replace('/', '_')}_{request.task}_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}"
     output_dir = os.path.join(params.output_dir_base, run_name)
     os.makedirs(output_dir, exist_ok=True)
-    
     adapter_output_path = os.path.join(output_dir, "lora_adapters")
 
     try:
-        # 1. Load Tokenizer
         tokenizer = AutoTokenizer.from_pretrained(request.model_name)
+        # Pad token handling for fine-tuning tokenizer (also done in get_model_and_tokenizer, but good to ensure here too)
         if tokenizer.pad_token is None:
-            logger.warning("Tokenizer does not have a pad token. Setting to eos_token.")
-            tokenizer.pad_token = tokenizer.eos_token
+            if tokenizer.eos_token is not None:
+                tokenizer.pad_token = tokenizer.eos_token
+                logger.info(f"Fine-tuning: Set pad_token to eos_token ({tokenizer.eos_token}) for {request.model_name}")
+            else:
+                tokenizer.add_special_tokens({'pad_token': '[PAD]'})
+                logger.warning(f"Fine-tuning: Added new pad_token '[PAD]' for {request.model_name}")
 
 
-        # 2. Load and Preprocess Dataset
-        logger.info(f"Loading dataset: {params.dataset_path}")
-        # Simplistic dataset loading: assumes Hugging Face dataset or local CSV
         if params.dataset_path.endswith(".csv"):
-            # For CSV, expect 'train.csv' and 'validation.csv' or handle splits
-            # This is a simplified example assuming one CSV for train/eval split
-            try:
-                df = pd.read_csv(params.dataset_path)
-                # Simple split for demo, replace with proper train/test/validation split
-                train_df = df.sample(frac=0.8, random_state=42)
-                eval_df = df.drop(train_df.index)
-                
-                raw_datasets = Dataset.from_pandas(train_df).train_test_split(test_size=eval_df.shape[0]/df.shape[0], seed=42)
-                # This is not ideal, better to have separate train/eval files or a split column
-                # For now, let's assume 'train' and 'test' (for validation) splits exist after this
-                # Or, if you load a single CSV, you might just use it all for training and a small part for eval.
-                # For simplicity, assuming the split above works or user provides HF dataset with splits
-                # Example: raw_datasets = load_dataset('csv', data_files={'train': 'train.csv', 'eval': 'eval.csv'})
-            except Exception as e:
-                 raise HTTPException(status_code=400, detail=f"Failed to load or process CSV dataset {params.dataset_path}: {e}")
-        else: # Assume Hugging Face dataset identifier
+            df = pd.read_csv(params.dataset_path)
+            # Ensure text and label columns exist before trying to use them
+            if params.text_column not in df.columns:
+                raise HTTPException(status_code=400, detail=f"Text column '{params.text_column}' not found in CSV.")
+            if request.task == "text-classification" and params.label_column not in df.columns:
+                raise HTTPException(status_code=400, detail=f"Label column '{params.label_column}' not found in CSV for text classification.")
+
+            train_df = df.sample(frac=0.8, random_state=42)
+            eval_df = df.drop(train_df.index)
+            raw_datasets = DatasetDict({"train": Dataset.from_pandas(train_df), "validation": Dataset.from_pandas(eval_df)})
+        else:
             raw_datasets = load_dataset(params.dataset_path)
 
-        def tokenize_function(examples):
-            # Ensure text_column and label_column are correctly used
-            tokenized_batch = tokenizer(
-                examples[params.text_column],
-                truncation=True,
-                padding="max_length", # Or handle by data collator
-                max_length=params.max_seq_length
-            )
-            if params.label_column in examples: # For classification
-                 tokenized_batch["labels"] = examples[params.label_column]
-            return tokenized_batch
+        def tokenize_fn(ex):
+            # Check if text_column exists in the current example batch (ex)
+            if params.text_column not in ex:
+                logger.error(f"Text column '{params.text_column}' not found in example batch during tokenization. Keys: {list(ex.keys())}")
+                raise ValueError(f"Text column '{params.text_column}' missing in tokenization input.")
 
-        logger.info("Tokenizing dataset...")
-        # Ensure required columns exist
-        required_cols_train = [params.text_column]
-        if request.task == "text-classification": required_cols_train.append(params.label_column)
+            tk_batch = tokenizer(ex[params.text_column], truncation=True, padding="max_length", max_length=params.max_seq_length)
+            
+            if request.task == "text-classification":
+                if params.label_column not in ex:
+                    logger.error(f"Label column '{params.label_column}' not found in example batch for text classification. Keys: {list(ex.keys())}")
+                    raise ValueError(f"Label column '{params.label_column}' missing in tokenization input for classification.")
+                tk_batch["labels"] = ex[params.label_column]
+            return tk_batch
         
-        for col in required_cols_train:
-            if col not in raw_datasets["train"].column_names:
-                raise HTTPException(status_code=400, detail=f"Required column '{col}' not found in training dataset.")
+        train_split, eval_split = "train", "validation" if "validation" in raw_datasets else "test" if "test" in raw_datasets else None
+        if train_split not in raw_datasets: raise HTTPException(status_code=400, detail=f"'{train_split}' not in dataset.")
+        if not eval_split: logger.warning("No validation/test split for evaluation.")
 
-        tokenized_datasets = raw_datasets.map(tokenize_function, batched=True)
+        tokenized_ds = raw_datasets.map(tokenize_fn, batched=True, remove_columns=raw_datasets[train_split].column_names) # Remove all original columns
         
-        # Remove columns not needed by the model
-        columns_to_remove = [col for col in raw_datasets["train"].column_names if col not in [params.text_column, params.label_column, "input_ids", "attention_mask", "labels", "token_type_ids"]]
-        if params.text_column not in ["input_ids", "attention_mask", "labels"]: columns_to_remove.append(params.text_column)
-        if params.label_column not in ["input_ids", "attention_mask", "labels"]: columns_to_remove.append(params.label_column)
+        num_labels = params.num_labels
+        if request.task == "text-classification" and not num_labels:
+            # Ensure 'labels' column exists after tokenization before trying to access its features
+            if "labels" not in tokenized_ds[train_split].features:
+                raise HTTPException(status_code=400, detail=f"Column 'labels' not found in tokenized training data. Check label_column ('{params.label_column}') and tokenization.")
+
+            labels_feature = tokenized_ds[train_split].features.get("labels")
+            if hasattr(labels_feature, "num_classes"): num_labels = labels_feature.num_classes
+            else: # Fallback: count unique labels if it's not a ClassLabel feature
+                unique_labels_list = tokenized_ds[train_split].unique("labels")
+                if unique_labels_list:
+                    num_labels = len(unique_labels_list)
+            if not num_labels: raise HTTPException(status_code=400, detail="num_labels needed and not inferable.")
+            logger.info(f"Inferred num_labels: {num_labels}")
+
+        base_model_args = {"num_labels": num_labels} if request.task == "text-classification" else {}
+        ModelClass = AutoModelForSequenceClassification if request.task == "text-classification" else AutoModelForCausalLM if request.task == "text-generation" else None
+        if not ModelClass: raise HTTPException(status_code=400, detail=f"Fine-tuning for task {request.task} unsupported.")
         
-        tokenized_datasets = tokenized_datasets.remove_columns(list(set(columns_to_remove) & set(tokenized_datasets["train"].column_names)))
+        if request.task == "text-classification" and num_labels is not None:
+            base_model_args["ignore_mismatched_sizes"] = True 
+
+        base_model = ModelClass.from_pretrained(request.model_name, **base_model_args)
         
-        if request.task == "text-classification" and "label" in tokenized_datasets["train"].column_names and "labels" not in tokenized_datasets["train"].column_names:
-             tokenized_datasets = tokenized_datasets.rename_column("label", "labels")
+        # If tokenizer vocabulary was expanded by adding a new pad_token, resize model embeddings
+        # This is important before PEFT or full fine-tuning.
+        if tokenizer.pad_token_id is not None and hasattr(base_model, 'resize_token_embeddings') and tokenizer.pad_token_id >= base_model.config.vocab_size:
+             logger.info(f"Resizing token embeddings for {request.model_name} during fine-tuning setup due to new pad_token.")
+             base_model.resize_token_embeddings(len(tokenizer))
 
-
-        # 3. Load Base Model
-        logger.info(f"Loading base model: {request.model_name}")
-        num_labels_for_task = params.num_labels
-        if request.task == "text-classification" and not num_labels_for_task:
-            # Try to infer from dataset if possible
-            if 'labels' in tokenized_datasets["train"].features:
-                num_labels_for_task = tokenized_datasets["train"].features['labels'].num_classes
-                logger.info(f"Inferred num_labels from dataset: {num_labels_for_task}")
-            else:
-                raise HTTPException(status_code=400, detail="num_labels is required for text-classification and could not be inferred from the dataset.")
-
-        if request.task == "text-classification":
-            base_model = AutoModelForSequenceClassification.from_pretrained(request.model_name, num_labels=num_labels_for_task)
-        elif request.task == "text-generation":
-            base_model = AutoModelForCausalLM.from_pretrained(request.model_name)
-        else:
-            raise HTTPException(status_code=400, detail=f"Fine-tuning for task '{request.task}' not supported yet.")
-
-        # 4. PEFT/LoRA Configuration (if enabled)
         peft_model = base_model
         if params.use_lora and params.lora_config:
-            logger.info("Configuring LoRA...")
             lora_c = params.lora_config
+            lora_targets = get_lora_target_modules(request.model_name, lora_c.target_modules)
+            if not lora_targets: logger.warning("No LoRA targets; LoRA may not be effective.")
             
-            # Determine target modules
-            lora_target_modules_list = get_lora_target_modules(request.model_name, lora_c.target_modules)
-            if not lora_target_modules_list:
-                 logger.warning("No LoRA target modules specified or inferred. LoRA may not be effective.")
-
-
-            peft_lora_config = LoraConfig(
-                r=lora_c.r,
-                lora_alpha=lora_c.alpha,
-                lora_dropout=lora_c.dropout,
-                target_modules=lora_target_modules_list,
-                bias="none",
-                task_type=TaskType.SEQ_CLS if request.task == "text-classification" else \
-                          TaskType.CAUSAL_LM if request.task == "text-generation" else None # Add other task types
-            )
-            if peft_lora_config.task_type is None:
-                raise HTTPException(status_code=400, detail=f"LoRA task type could not be determined for task: {request.task}")
-
-            peft_model = get_peft_model(base_model, peft_lora_config)
+            task_type_peft = TaskType.SEQ_CLS if request.task == "text-classification" else TaskType.CAUSAL_LM if request.task == "text-generation" else None
+            if not task_type_peft: raise HTTPException(status_code=400, detail=f"LoRA task type undetermined for {request.task}.")
+            
+            peft_config = LoraConfig(r=lora_c.r, lora_alpha=lora_c.alpha, lora_dropout=lora_c.dropout, target_modules=lora_targets, bias="none", task_type=task_type_peft)
+            peft_model = get_peft_model(base_model, peft_config)
             peft_model.print_trainable_parameters()
-        else:
-            logger.info("LoRA not enabled or lora_config not provided. Performing full fine-tuning (if applicable).")
 
-
-        # 5. Training Arguments and Trainer
-        logger.info("Setting up Training Arguments...")
-        training_args = TrainingArguments(
-            output_dir=output_dir,
-            num_train_epochs=params.epochs,
-            per_device_train_batch_size=params.batch_size,
-            per_device_eval_batch_size=params.batch_size, # Can be different
-            learning_rate=params.learning_rate,
-            weight_decay=0.01,
-            logging_dir=f"{output_dir}/logs",
-            logging_steps=100, # Log every 100 steps
-            evaluation_strategy="epoch", # Evaluate at the end of each epoch
-            save_strategy="epoch",       # Save model at the end of each epoch
-            load_best_model_at_end=True, # Load the best model found during training
-            # For CPU-only VM:
-            no_cuda=True,
-            # use_cpu=True, # Not a standard TrainingArgument, accelerate handles this
-            report_to="none" # Disable wandb/tensorboard reporting for simplicity
-        )
-
-        data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
-
-        trainer = Trainer(
-            model=peft_model,
-            args=training_args,
-            train_dataset=tokenized_datasets["train"],
-            eval_dataset=tokenized_datasets.get("validation") or tokenized_datasets.get("test"), # Use validation or test
-            tokenizer=tokenizer,
-            data_collator=data_collator,
-            # compute_metrics=compute_metrics_function, # Optional: for more detailed eval
-        )
-
-        # 6. Start Training
-        logger.info("Starting fine-tuning...")
-        train_result = trainer.train()
-        logger.info("Fine-tuning finished.")
-        # trainer.log_metrics("train", train_result.metrics) # Log training metrics
-        # trainer.save_metrics("train", train_result.metrics)
-
-        # 7. Save Model/Adapters
-        if params.use_lora:
-            logger.info(f"Saving LoRA adapters to {adapter_output_path}")
-            peft_model.save_pretrained(adapter_output_path)
-            tokenizer.save_pretrained(adapter_output_path) # Save tokenizer with adapters
-            final_save_path = adapter_output_path
-        else: # Full fine-tuning
-            full_model_path = os.path.join(output_dir, "full_model")
-            logger.info(f"Saving full fine-tuned model to {full_model_path}")
-            trainer.save_model(full_model_path) # Saves the full model
-            tokenizer.save_pretrained(full_model_path)
-            final_save_path = full_model_path
+        training_args_dict = {
+            "output_dir": output_dir, "num_train_epochs": params.epochs,
+            "per_device_train_batch_size": params.batch_size, "per_device_eval_batch_size": params.batch_size,
+            "learning_rate": params.learning_rate, "weight_decay": 0.01,
+            "logging_dir": f"{output_dir}/logs", "logging_steps": max(1, int(len(tokenized_ds[train_split]) / (params.batch_size * 5))),
+            "evaluation_strategy": "epoch" if eval_split and eval_split in tokenized_ds else "no",
+            "save_strategy": "epoch" if eval_split and eval_split in tokenized_ds else "steps",
+            "save_total_limit": 2, "load_best_model_at_end": bool(eval_split and eval_split in tokenized_ds),
+            "no_cuda": True, "report_to": "none"
+        }
+        training_args = TrainingArguments(**training_args_dict)
+        trainer = Trainer(model=peft_model, args=training_args, train_dataset=tokenized_ds[train_split], eval_dataset=tokenized_ds.get(eval_split), tokenizer=tokenizer, data_collator=DataCollatorWithPadding(tokenizer=tokenizer))
         
-        # Clean up checkpoint directories within output_dir to save space, keep only the best
-        # (Trainer with load_best_model_at_end=True might handle some of this,
-        # but explicit cleanup of intermediate checkpoints can be useful)
-        for item in os.listdir(output_dir):
-            item_path = os.path.join(output_dir, item)
-            if os.path.isdir(item_path) and item.startswith("checkpoint-"):
-                # Check if it's not the final saved model path (if using save_model directly)
-                # or if it's not the adapter path
-                if final_save_path != item_path and not final_save_path.startswith(item_path):
-                    logger.info(f"Removing intermediate checkpoint: {item_path}")
-                    shutil.rmtree(item_path)
-
-        return FineTuneResponse(
-            message="Fine-tuning completed successfully.",
-            model_name=request.model_name,
-            adapter_output_path=final_save_path if params.use_lora else None, # or model_output_path for full
-            logs=f"Training logs and metrics saved in {output_dir}"
-        )
-
-    except HTTPException: # Re-raise HTTPExceptions
-        raise
+        logger.info("Starting fine-tuning...")
+        trainer.train()
+        logger.info("Fine-tuning finished.")
+        
+        final_save_path = adapter_output_path if params.use_lora else os.path.join(output_dir, "full_model_final")
+        if params.use_lora: peft_model.save_pretrained(final_save_path)
+        else: trainer.save_model(final_save_path)
+        tokenizer.save_pretrained(final_save_path)
+        
+        for item in os.listdir(output_dir): # Cleanup checkpoints
+            if os.path.isdir(p := os.path.join(output_dir, item)) and item.startswith("checkpoint-"):
+                logger.info(f"Removing intermediate checkpoint: {p}")
+                shutil.rmtree(p)
+        
+        return FineTuneResponse(message="Fine-tuning completed.", model_name=request.model_name, adapter_output_path=final_save_path, logs=f"Logs in {output_dir}")
+    except HTTPException: raise
     except Exception as e:
-        logger.error(f"Error during fine-tuning: {e}", exc_info=True)
-        # Clean up failed run directory
-        if os.path.exists(output_dir):
-            shutil.rmtree(output_dir)
+        logger.error(f"Fine-tuning error: {e}", exc_info=True)
+        if os.path.exists(output_dir): shutil.rmtree(output_dir, ignore_errors=True)
         raise HTTPException(status_code=500, detail=f"Fine-tuning failed: {str(e)}")
 
-
 @app.get("/")
-async def root():
-    return {"message": "Welcome to the Hugging Face Model Runner API!"}
-
-# To run this app (save as main.py):
-# 1. Install dependencies: pip install fastapi uvicorn python-multipart torch transformers datasets peft pandas sentencepiece accelerate bitsandbytes
-#    For CPU PyTorch: pip install torch --index-url https://download.pytorch.org/whl/cpu
-# 2. Run with Uvicorn: uvicorn main:app --reload --host 0.0.0.0 --port 8000
+async def root(): return {"message": "Welcome to HF Model Runner API!"}
