@@ -7,6 +7,7 @@ import logging
 from typing import List, Dict, Any, Optional, Union
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware # Import CORSMiddleware
 from pydantic import BaseModel, Field
 import torch
 from transformers import (
@@ -14,9 +15,9 @@ from transformers import (
     AutoModelForSequenceClassification,
     AutoModelForCausalLM,
     # Add other AutoModel types as needed, e.g.:
-    # AutoModelForQuestionAnswering,
-    # AutoModelForTokenClassification,
-    # AutoModelForSeq2SeqLM,
+    AutoModelForQuestionAnswering,
+    AutoModelForTokenClassification,
+    AutoModelForSeq2SeqLM,
     TrainingArguments,
     Trainer,
     DataCollatorWithPadding,
@@ -83,9 +84,29 @@ class FineTuneResponse(BaseModel):
 
 # --- FastAPI App Initialization ---
 app = FastAPI(
-    title="Hugging Face Model Runner API",
+    title="Model Runner API",
     description="API to run inference and fine-tune Hugging Face models.",
     version="0.1.0"
+)
+
+# --- CORS Middleware Configuration ---
+# IMPORTANT: Adjust origins as needed for your environment.
+# For development, you might allow "http://localhost:3000" (if your Next.js runs there).
+# For production, specify your frontend's domain: "https://yourdomain.com".
+# Using ["*"] allows all origins, which is convenient for development but
+# should be restricted in production for security.
+
+origins = [
+    "http://localhost:3000",  # For local Next.js development
+    "https://orchestrator.forgemission.com", # production domain
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,  # List of origins that are allowed to make requests
+    allow_credentials=True, # Allow cookies to be included in requests
+    allow_methods=["*"],    # Allow all methods (GET, POST, OPTIONS, etc.)
+    allow_headers=["*"],    # Allow all headers
 )
 
 # --- Global Variables / Model Cache (Simple In-Memory) ---
