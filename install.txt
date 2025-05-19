@@ -1,0 +1,63 @@
+**Setup and Run on Ubuntu VM:**
+
+1.  **Update System and Install Python:**
+    ```bash
+    sudo apt update
+    sudo apt upgrade -y
+    sudo apt install python3 python3-pip python3-venv git vim -y
+    sudo apt install -y build-essential cmake python3-dev
+    ```
+
+2.  **Create Project Directory and Virtual Environment:**
+    ```bash
+    mkdir hf-backend
+    cd hf-backend
+    python3 -m venv venv
+    source venv/bin/activate
+    ```
+
+3. git clone https://github.com/samibegg/hf-backend.git
+
+5.  **Install Dependencies:**
+    ```bash
+    pip install --upgrade pip
+    # If you previously had issues with disk space during pip install, try these first:
+    export TMPDIR=~/pip_build_temp 
+    mkdir -p $TMPDIR
+    export PIP_CACHE_DIR=~/.cache/pip_project_cache # Optional, pip default is usually fine if /home has space
+    mkdir -p $PIP_CACHE_DIR # Optional, corresponding to above
+    
+    pip install -r requirements.txt
+    ```
+    *(Note: `torch` installation for CPU is specified in `requirements.txt`. If you encounter issues, you might need to install it separately first using the specified index URL).*
+
+6.  **Run the FastAPI Application with Uvicorn:**
+    ```bash
+    uvicorn main:app --reload --host 0.0.0.0 --port 8000
+    ```
+    * `--reload`: Uvicorn will automatically restart the server when code changes (for development).
+    * `--host 0.0.0.0`: Makes the server accessible from outside the VM (e.g., from your local machine if the VM's port 8000 is open and network configured).
+    * `--port 8000`: Specifies the port to run on.
+
+7.  **Accessing the API:**
+    * Your API will be available at `http://<your_vm_ip>:8000`.
+    * The interactive API documentation (Swagger UI) will be at `http://<your_vm_ip>:8000/docs`.
+    * ReDoc documentation will be at `http://<your_vm_ip>:8000/redoc`.
+
+**Important Considerations and Next Steps:**
+
+* **Asynchronous Fine-Tuning:** The current `/api/v1/finetune` endpoint is synchronous. For any real application, fine-tuning should be offloaded to a background task (using FastAPI's `BackgroundTasks` for simple cases, or a robust task queue like Celery with Redis/RabbitMQ). The endpoint would then immediately return a job ID, and you'd have other endpoints to check the status and retrieve results/logs.
+* **Error Handling and Logging:** The provided code has basic logging and error handling. Enhance this for production.
+* **Security:** For a public-facing API, implement authentication and authorization (e.g., OAuth2, API keys).
+* **Configuration Management:** Use environment variables or configuration files for settings like model directories, learning rates, etc., instead of hardcoding.
+* **Resource Limits:** Fine-tuning can be very resource-intensive (CPU, RAM). Monitor your VM's resources. For CPU fine-tuning, expect it to be slow.
+* **Dataset Handling:** The dataset loading in the fine-tuning endpoint has been improved but can be further enhanced for different dataset formats, splits (train/validation/test), and potentially allow uploads.
+* **LoRA Target Modules:** The `get_lora_target_modules` function provides some basic heuristics. For optimal LoRA performance, users should ideally specify the `target_modules` based on the architecture of the specific model they are fine-tuning. The UI currently sends this as a comma-separated string, which the backend parses.
+* **State Management for Models:** The simple `loaded_models_cache` dictionary is for demonstration. In a multi-worker Uvicorn setup or a more complex deployment, this in-memory cache won't be shared or might lead to excessive memory use. Consider strategies like loading models on demand per request (slower startup for the request but better memory management) or a more sophisticated caching layer if you have frequently accessed models.
+* **Production Deployment:** For production, you'd typically run Uvicorn behind a reverse proxy like Nginx or Traefik, and use a process manager like Gunicorn to manage Uvicorn workers.
+* **Dataset Splitting for CSV:** The CSV loading logic now creates a `DatasetDict` with 'train' and 'validation' splits. This is a basic 80/20 split. For more robust handling, consider requiring separate train/validation CSV files or a column indicating the split.
+* **Column Removal and Renaming:** The logic for removing unnecessary columns and renaming the label column in the `run_fine_tuning` function has been made more robust to handle cases where columns might not exist in all splits or are already correctly named.
+* **`num_labels` Inference:** Improved logic to infer `num_labels` for classification tasks from the dataset features or by counting unique labels if it's not a `ClassLabel` type.
+* **Trainer Arguments:** Adjusted `logging_steps`, `save_strategy`, `load_best_model_at_end`, and `save_total_limit` in `TrainingArguments` for more sensible defaults, especially when an evaluation set might be missing.
+* **Checkpoint Cleanup:** Added a more explicit loop to remove intermediate Hugging Face Trainer checkpoint directories (e.g., `checkpoint-XXXX`) after successful fine-tuning to save disk space. The final model (LoRA adapter or full model) is preserved.
+
