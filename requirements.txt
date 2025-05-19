@@ -9,6 +9,7 @@ pandas
 sentencepiece
 accelerate
 protobuf
+hf_xet
 # bitsandbytes # Often a PEFT/Transformers dependency, primarily for GPU quantization but good to list
 scikit-learn # If you add more complex metrics computation
 
