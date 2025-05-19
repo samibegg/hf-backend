@@ -112,7 +112,7 @@ class AnomalyDetectionRequest(BaseModel):
 class AnomalyDetectionResponse(BaseModel):
     text: str
     is_anomaly: bool
-    reconstruction_error: float # Pydantic expects standard Python float
+    reconstruction_error: float 
     threshold_used: float
     embedding_model_used: str
     autoencoder_model_used: str
@@ -121,7 +121,7 @@ class AnomalyDetectionResponse(BaseModel):
 app = FastAPI(
     title="Hugging Face Model Runner API",
     description="API to run inference, fine-tune models, and detect anomalies.",
-    version="0.2.0"
+    version="0.2.1" # Version bump
 )
 
 # --- CORS Middleware Configuration ---
@@ -139,6 +139,28 @@ loaded_embedding_models_cache = {}
 loaded_autoencoders_cache = {} 
 
 # --- Helper Functions ---
+
+def sanitize_value_for_json(value: Any) -> Any:
+    """
+    Recursively sanitizes values that might be NumPy types to native Python types for JSON serialization.
+    """
+    if isinstance(value, list):
+        return [sanitize_value_for_json(item) for item in value]
+    elif isinstance(value, dict):
+        return {k: sanitize_value_for_json(v) for k, v in value.items()}
+    elif isinstance(value, (np.float32, np.float64)):
+        return float(value)
+    elif isinstance(value, (np.int32, np.int64, np.int_)):
+        return int(value)
+    elif isinstance(value, np.bool_):
+        return bool(value)
+    elif isinstance(value, np.ndarray): # Handle arrays, convert to list
+        return sanitize_value_for_json(value.tolist())
+    elif isinstance(value, np.generic): # Catch-all for other numpy scalar types
+        return value.item()
+    return value
+
+
 def get_embedding_model(model_name: str):
     if model_name in loaded_embedding_models_cache:
         logger.info(f"Using cached embedding model: {model_name}")
@@ -283,14 +305,14 @@ async def run_inference_endpoint(request: InferenceRequest):
             quantization=request.quantization
         )
 
-        predictions = None
+        raw_predictions = None # Store raw pipeline output
         if request.task == "text-classification":
             classifier = pipeline(
                 "sentiment-analysis" if "sentiment" in request.model_name.lower() or "sst-2" in request.model_name.lower() else "text-classification",
                 model=model, tokenizer=tokenizer, device=-1 
             )
             results = classifier(request.input_text if isinstance(request.input_text, list) else [request.input_text])
-            predictions = results
+            raw_predictions = results
 
         elif request.task == "text-generation":
             if tokenizer.pad_token_id is None:
@@ -304,22 +326,23 @@ async def run_inference_endpoint(request: InferenceRequest):
             
             with torch.no_grad(): outputs = model.generate(**inputs, **final_gen_args)
             
+            decoded_outputs = []
             if isinstance(request.input_text, list) and len(outputs) >= len(inputs["input_ids"]):
                 num_return_sequences = final_gen_args.get("num_return_sequences", 1)
                 num_inputs = len(inputs["input_ids"])
-                predictions = []
                 for i in range(num_inputs):
-                    batch_predictions = []
+                    batch_predictions_texts = []
                     for j in range(num_return_sequences):
                         output_idx = i * num_return_sequences + j
                         if output_idx < len(outputs):
-                           batch_predictions.append(tokenizer.decode(outputs[output_idx], skip_special_tokens=True))
-                    predictions.append(batch_predictions[0] if num_return_sequences == 1 else batch_predictions)
+                           batch_predictions_texts.append(tokenizer.decode(outputs[output_idx], skip_special_tokens=True))
+                    decoded_outputs.append(batch_predictions_texts[0] if num_return_sequences == 1 else batch_predictions_texts)
             elif not isinstance(request.input_text, list):
-                predictions = tokenizer.decode(outputs[0], skip_special_tokens=True)
+                decoded_outputs = tokenizer.decode(outputs[0], skip_special_tokens=True)
             else: 
                 logger.warning("Decoding multiple sequences for batched text generation, structure might vary.")
-                predictions = [tokenizer.decode(output_seq, skip_special_tokens=True) for output_seq in outputs]
+                decoded_outputs = [tokenizer.decode(output_seq, skip_special_tokens=True) for output_seq in outputs]
+            raw_predictions = decoded_outputs
         
         elif request.task == "question-answering":
             if not request.context:
@@ -329,7 +352,7 @@ async def run_inference_endpoint(request: InferenceRequest):
 
             qa_pipeline = pipeline("question-answering", model=model, tokenizer=tokenizer, device=-1)
             results = qa_pipeline(question=request.input_text, context=request.context)
-            predictions = results
+            raw_predictions = results
 
         elif request.task == "summarization":
             if not request.input_text:
@@ -342,10 +365,10 @@ async def run_inference_endpoint(request: InferenceRequest):
 
             if isinstance(request.input_text, str):
                 results = summarizer(request.input_text, **final_summary_args)
-                predictions = results[0]['summary_text'] if results else None
+                # Pipeline returns a list with one dict for single string input
+                raw_predictions = results[0] if results else None 
             elif isinstance(request.input_text, list):
-                results = summarizer(request.input_text, **final_summary_args)
-                predictions = [res['summary_text'] for res in results] if results else []
+                raw_predictions = summarizer(request.input_text, **final_summary_args)
             else:
                 raise HTTPException(status_code=400, detail="Invalid input_text format for summarization.")
 
@@ -356,10 +379,9 @@ async def run_inference_endpoint(request: InferenceRequest):
             gen_args = request.generation_args or {}
             if isinstance(request.input_text, str):
                 results = translator(request.input_text, **gen_args)
-                predictions = results[0]['translation_text'] if results else None
+                raw_predictions = results[0] if results else None
             elif isinstance(request.input_text, list):
-                results = translator(request.input_text, **gen_args)
-                predictions = [res['translation_text'] for res in results] if results else []
+                raw_predictions = translator(request.input_text, **gen_args)
             else:
                 raise HTTPException(status_code=400, detail="Invalid input_text format for translation.")
         
@@ -371,16 +393,21 @@ async def run_inference_endpoint(request: InferenceRequest):
                 "ner", model=model, tokenizer=tokenizer, device=-1, grouped_entities=True 
             )
             if isinstance(request.input_text, str):
-                predictions = token_classifier(request.input_text)
+                raw_predictions = token_classifier(request.input_text)
             elif isinstance(request.input_text, list):
-                predictions = token_classifier(request.input_text)
+                raw_predictions = token_classifier(request.input_text)
             else:
                 raise HTTPException(status_code=400, detail="Invalid input_text format for token classification.")
         else:
             raise HTTPException(status_code=400, detail=f"Inference for task '{request.task}' not yet implemented.")
 
+        # Sanitize predictions before returning
+        sanitized_predictions = sanitize_value_for_json(raw_predictions)
+
         return InferenceResponse(
-            predictions=predictions, model_used=request.model_name, quantization_applied=request.quantization
+            predictions=sanitized_predictions, 
+            model_used=request.model_name, 
+            quantization_applied=request.quantization
         )
     except Exception as e:
         logger.error(f"Error during inference: {e}", exc_info=True)
@@ -412,7 +439,7 @@ async def detect_text_anomaly(request: AnomalyDetectionRequest):
 
         loss_fn = nn.MSELoss()
         reconstruction_error_tensor = loss_fn(reconstructed_embedding, input_embedding)
-        reconstruction_error_float = float(reconstruction_error_tensor.item()) # Explicit cast to Python float
+        reconstruction_error_float = float(reconstruction_error_tensor.item()) 
         logger.info(f"Reconstruction error: {reconstruction_error_float}")
 
         is_anomaly = reconstruction_error_float > request.threshold
@@ -421,8 +448,8 @@ async def detect_text_anomaly(request: AnomalyDetectionRequest):
         return AnomalyDetectionResponse(
             text=request.text,
             is_anomaly=is_anomaly,
-            reconstruction_error=reconstruction_error_float, # Use the Python float
-            threshold_used=request.threshold,
+            reconstruction_error=reconstruction_error_float, 
+            threshold_used=float(request.threshold), # Ensure threshold is also Python float
             embedding_model_used=request.embedding_model_name,
             autoencoder_model_used=request.autoencoder_model_path
         )
