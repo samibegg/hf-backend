@@ -13,7 +13,7 @@ import torch
 import torch.nn as nn # For Autoencoder
 from transformers import (
     AutoTokenizer,
-    AutoModel, # For generic embeddings if needed, or SentenceTransformer
+    AutoModel, 
     AutoModelForSequenceClassification,
     AutoModelForCausalLM,
     AutoModelForQuestionAnswering,
@@ -24,7 +24,7 @@ from transformers import (
     DataCollatorWithPadding,
     pipeline
 )
-from sentence_transformers import SentenceTransformer # For high-quality sentence embeddings
+from sentence_transformers import SentenceTransformer 
 from datasets import load_dataset, Dataset, DatasetDict, Sequence
 from peft import LoraConfig, get_peft_model, TaskType, PeftModel, PeftConfig
 import numpy as np
@@ -38,19 +38,16 @@ logger = logging.getLogger(__name__)
 class TextEmbeddingAutoencoder(nn.Module):
     def __init__(self, embedding_dim: int, encoding_dim: int):
         super(TextEmbeddingAutoencoder, self).__init__()
-        # Encoder
         self.encoder = nn.Sequential(
             nn.Linear(embedding_dim, int(embedding_dim / 2)),
             nn.ReLU(),
             nn.Linear(int(embedding_dim / 2), encoding_dim),
-            nn.ReLU() # Or Tanh, or nothing for bottleneck
+            nn.ReLU() 
         )
-        # Decoder
         self.decoder = nn.Sequential(
             nn.Linear(encoding_dim, int(embedding_dim / 2)),
             nn.ReLU(),
             nn.Linear(int(embedding_dim / 2), embedding_dim)
-            # Sigmoid if embeddings are normalized to [0,1], otherwise often linear
         )
 
     def forward(self, x):
@@ -59,7 +56,6 @@ class TextEmbeddingAutoencoder(nn.Module):
         return decoded
 
 # --- Pydantic Models for API ---
-# (Existing Pydantic models: InferenceRequest, InferenceResponse, etc. remain here)
 class InferenceRequest(BaseModel):
     task: str = Field(..., description="NLP task")
     model_name: str = Field(..., description="Hugging Face model identifier")
@@ -105,55 +101,51 @@ class FineTuneResponse(BaseModel):
     adapter_output_path: Optional[str] = None
     logs: Optional[str] = None
 
-# New Pydantic models for Anomaly Detection
 class AnomalyDetectionRequest(BaseModel):
     text: str = Field(..., description="Input text to check for anomaly")
     embedding_model_name: str = Field("sentence-transformers/all-MiniLM-L6-v2", description="Sentence Transformer model for embeddings")
     autoencoder_model_path: str = Field(..., description="Path to the saved PyTorch autoencoder state_dict")
     autoencoder_embedding_dim: int = Field(384, description="Embedding dimension the AE was trained on (e.g., 384 for all-MiniLM-L6-v2)")
     autoencoder_encoding_dim: int = Field(64, description="Bottleneck encoding dimension of the AE")
-    threshold: float = Field(0.1, description="Reconstruction error threshold for anomaly classification") # Example threshold
+    threshold: float = Field(0.1, description="Reconstruction error threshold for anomaly classification")
 
 class AnomalyDetectionResponse(BaseModel):
     text: str
     is_anomaly: bool
-    reconstruction_error: float
+    reconstruction_error: float # Pydantic expects standard Python float
     threshold_used: float
     embedding_model_used: str
     autoencoder_model_used: str
-
 
 # --- FastAPI App Initialization ---
 app = FastAPI(
     title="Hugging Face Model Runner API",
     description="API to run inference, fine-tune models, and detect anomalies.",
-    version="0.2.0" # Version bump
+    version="0.2.0"
 )
 
 # --- CORS Middleware Configuration ---
 origins = [
     "http://localhost:3000",
-    "https://yourdomain.com", # Replace with your frontend's production domain
+    "https://yourdomain.com", 
 ]
 app.add_middleware(
     CORSMiddleware, allow_origins=origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
 )
 
 # --- Global Variables / Model Cache ---
-loaded_models_cache = {} # For Hugging Face task-specific models and tokenizers
-loaded_embedding_models_cache = {} # For sentence transformers or other embedding models
-loaded_autoencoders_cache = {} # For trained PyTorch autoencoders
+loaded_models_cache = {} 
+loaded_embedding_models_cache = {} 
+loaded_autoencoders_cache = {} 
 
 # --- Helper Functions ---
 def get_embedding_model(model_name: str):
-    """Loads a Sentence Transformer model. Caches it."""
     if model_name in loaded_embedding_models_cache:
         logger.info(f"Using cached embedding model: {model_name}")
         return loaded_embedding_models_cache[model_name]
     
     logger.info(f"Loading sentence embedding model: {model_name}...")
     try:
-        # Assuming CPU for now, can add device parameter if GPU is available
         model = SentenceTransformer(model_name, device='cpu')
         loaded_embedding_models_cache[model_name] = model
         logger.info(f"Embedding model {model_name} loaded successfully.")
@@ -163,7 +155,6 @@ def get_embedding_model(model_name: str):
         raise HTTPException(status_code=500, detail=f"Could not load sentence embedding model: {model_name}")
 
 def load_autoencoder_model(path: str, embedding_dim: int, encoding_dim: int):
-    """Loads a pre-trained PyTorch Autoencoder model. Caches it."""
     cache_key = (path, embedding_dim, encoding_dim)
     if cache_key in loaded_autoencoders_cache:
         logger.info(f"Using cached autoencoder model: {path}")
@@ -175,10 +166,10 @@ def load_autoencoder_model(path: str, embedding_dim: int, encoding_dim: int):
         raise HTTPException(status_code=404, detail=f"Autoencoder model not found at path: {path}")
     
     try:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu") # Use GPU if available
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu") 
         autoencoder = TextEmbeddingAutoencoder(embedding_dim, encoding_dim).to(device)
         autoencoder.load_state_dict(torch.load(path, map_location=device))
-        autoencoder.eval() # Set to evaluation mode
+        autoencoder.eval() 
         loaded_autoencoders_cache[cache_key] = autoencoder
         logger.info(f"Autoencoder model {path} loaded successfully to {device}.")
         return autoencoder
@@ -186,9 +177,7 @@ def load_autoencoder_model(path: str, embedding_dim: int, encoding_dim: int):
         logger.error(f"Error loading autoencoder model {path}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Could not load autoencoder model: {path}")
 
-
 def get_model_and_tokenizer(model_name: str, task: str, num_labels: Optional[int] = None, quantization: str = "none"):
-    # (Content from previous version - no changes here for this feature)
     cache_key_num_labels_suffix = None
     if task == "text-classification" or task == "token-classification":
         cache_key_num_labels_suffix = num_labels
@@ -263,7 +252,6 @@ def get_model_and_tokenizer(model_name: str, task: str, num_labels: Optional[int
     return model_to_load, tokenizer
 
 def get_lora_target_modules(model_name_or_path: str, user_specified_modules: Optional[Union[str, List[str]]]) -> List[str]:
-    # (Content from previous version)
     if isinstance(user_specified_modules, str):
         modules = [m.strip() for m in user_specified_modules.split(",") if m.strip()]
         if modules: return modules
@@ -287,7 +275,6 @@ def get_lora_target_modules(model_name_or_path: str, user_specified_modules: Opt
 # --- API Endpoints ---
 @app.post("/api/v1/infer", response_model=InferenceResponse)
 async def run_inference_endpoint(request: InferenceRequest):
-    # (Content from previous version - no changes here for this feature)
     logger.info(f"Received inference request: Task={request.task}, Model={request.model_name}")
     try:
         model, tokenizer = get_model_and_tokenizer(
@@ -399,8 +386,8 @@ async def run_inference_endpoint(request: InferenceRequest):
         logger.error(f"Error during inference: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
-
-# --- New Anomaly Detection Endpoint ---z@app.post("/api/v1/detect_anomaly", response_model=AnomalyDetectionResponse)
+# --- New Anomaly Detection Endpoint ---
+@app.post("/api/v1/detect_anomaly", response_model=AnomalyDetectionResponse)
 async def detect_text_anomaly(request: AnomalyDetectionRequest):
     logger.info(f"Received anomaly detection request for text: '{request.text[:50]}...'")
     logger.info(f"Using embedding model: {request.embedding_model_name}")
@@ -449,7 +436,6 @@ async def detect_text_anomaly(request: AnomalyDetectionRequest):
 
 @app.post("/api/v1/finetune", response_model=FineTuneResponse)
 async def run_fine_tuning_endpoint(request: FineTuneRequest, background_tasks: BackgroundTasks):
-    # (Content from previous version - no changes here for this feature)
     params = request.fine_tune_params
     logger.info(f"Fine-tune: Task={request.task}, Model={request.model_name}, Data={params.dataset_path}")
     run_name = f"{request.model_name.replace('/', '_')}_{request.task}_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}"
