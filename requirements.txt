@@ -6,7 +6,8 @@ datasets
 peft
 pandas
 sentencepiece
-accelerate # Required by Trainer, helps manage device placement (even for CPU)
+accelerate
+protobuf
 # bitsandbytes # Often a PEFT/Transformers dependency, primarily for GPU quantization but good to list
 scikit-learn # If you add more complex metrics computation
 
