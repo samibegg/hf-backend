@@ -7,24 +7,25 @@ import logging
 from typing import List, Dict, Any, Optional, Union
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks
-from fastapi.middleware.cors import CORSMiddleware # Import CORSMiddleware
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 import torch
+import torch.nn as nn # For Autoencoder
 from transformers import (
     AutoTokenizer,
+    AutoModel, # For generic embeddings if needed, or SentenceTransformer
     AutoModelForSequenceClassification,
     AutoModelForCausalLM,
     AutoModelForQuestionAnswering,
     AutoModelForSeq2SeqLM,
-    AutoModelForTokenClassification, # Added for Token Classification
+    AutoModelForTokenClassification,
     TrainingArguments,
     Trainer,
     DataCollatorWithPadding,
-    # DataCollatorForSeq2Seq, # Might be needed for Seq2Seq fine-tuning
-    # DataCollatorForTokenClassification, # Might be needed for Token Classification fine-tuning
     pipeline
 )
-from datasets import load_dataset, Dataset, DatasetDict
+from sentence_transformers import SentenceTransformer # For high-quality sentence embeddings
+from datasets import load_dataset, Dataset, DatasetDict, Sequence
 from peft import LoraConfig, get_peft_model, TaskType, PeftModel, PeftConfig
 import numpy as np
 import pandas as pd
@@ -33,7 +34,32 @@ import pandas as pd
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# --- PyTorch Autoencoder Definition ---
+class TextEmbeddingAutoencoder(nn.Module):
+    def __init__(self, embedding_dim: int, encoding_dim: int):
+        super(TextEmbeddingAutoencoder, self).__init__()
+        # Encoder
+        self.encoder = nn.Sequential(
+            nn.Linear(embedding_dim, int(embedding_dim / 2)),
+            nn.ReLU(),
+            nn.Linear(int(embedding_dim / 2), encoding_dim),
+            nn.ReLU() # Or Tanh, or nothing for bottleneck
+        )
+        # Decoder
+        self.decoder = nn.Sequential(
+            nn.Linear(encoding_dim, int(embedding_dim / 2)),
+            nn.ReLU(),
+            nn.Linear(int(embedding_dim / 2), embedding_dim)
+            # Sigmoid if embeddings are normalized to [0,1], otherwise often linear
+        )
+
+    def forward(self, x):
+        encoded = self.encoder(x)
+        decoded = self.decoder(encoded)
+        return decoded
+
 # --- Pydantic Models for API ---
+# (Existing Pydantic models: InferenceRequest, InferenceResponse, etc. remain here)
 class InferenceRequest(BaseModel):
     task: str = Field(..., description="NLP task")
     model_name: str = Field(..., description="Hugging Face model identifier")
@@ -66,7 +92,7 @@ class FineTuneParamsModel(BaseModel):
     output_dir_base: str = Field("./finetuned_models")
     max_seq_length: int = Field(384) 
     max_target_length: Optional[int] = Field(128, description="Max length for target sequences in seq2seq tasks")
-    num_labels: Optional[int] = None # For text classification or token classification if labels are integers
+    num_labels: Optional[int] = None
 
 class FineTuneRequest(BaseModel):
     task: str = Field(...)
@@ -79,11 +105,29 @@ class FineTuneResponse(BaseModel):
     adapter_output_path: Optional[str] = None
     logs: Optional[str] = None
 
+# New Pydantic models for Anomaly Detection
+class AnomalyDetectionRequest(BaseModel):
+    text: str = Field(..., description="Input text to check for anomaly")
+    embedding_model_name: str = Field("sentence-transformers/all-MiniLM-L6-v2", description="Sentence Transformer model for embeddings")
+    autoencoder_model_path: str = Field(..., description="Path to the saved PyTorch autoencoder state_dict")
+    autoencoder_embedding_dim: int = Field(384, description="Embedding dimension the AE was trained on (e.g., 384 for all-MiniLM-L6-v2)")
+    autoencoder_encoding_dim: int = Field(64, description="Bottleneck encoding dimension of the AE")
+    threshold: float = Field(0.1, description="Reconstruction error threshold for anomaly classification") # Example threshold
+
+class AnomalyDetectionResponse(BaseModel):
+    text: str
+    is_anomaly: bool
+    reconstruction_error: float
+    threshold_used: float
+    embedding_model_used: str
+    autoencoder_model_used: str
+
+
 # --- FastAPI App Initialization ---
 app = FastAPI(
     title="Hugging Face Model Runner API",
-    description="API to run inference and fine-tune Hugging Face models.",
-    version="0.1.0"
+    description="API to run inference, fine-tune models, and detect anomalies.",
+    version="0.2.0" # Version bump
 )
 
 # --- CORS Middleware Configuration ---
@@ -91,21 +135,60 @@ origins = [
     "http://localhost:3000",
     "https://yourdomain.com", # Replace with your frontend's production domain
 ]
-
 app.add_middleware(
-    CORSMiddleware,
-    allow_origins=origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    CORSMiddleware, allow_origins=origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
 )
 
 # --- Global Variables / Model Cache ---
-loaded_models_cache = {}
+loaded_models_cache = {} # For Hugging Face task-specific models and tokenizers
+loaded_embedding_models_cache = {} # For sentence transformers or other embedding models
+loaded_autoencoders_cache = {} # For trained PyTorch autoencoders
 
 # --- Helper Functions ---
+def get_embedding_model(model_name: str):
+    """Loads a Sentence Transformer model. Caches it."""
+    if model_name in loaded_embedding_models_cache:
+        logger.info(f"Using cached embedding model: {model_name}")
+        return loaded_embedding_models_cache[model_name]
+    
+    logger.info(f"Loading sentence embedding model: {model_name}...")
+    try:
+        # Assuming CPU for now, can add device parameter if GPU is available
+        model = SentenceTransformer(model_name, device='cpu')
+        loaded_embedding_models_cache[model_name] = model
+        logger.info(f"Embedding model {model_name} loaded successfully.")
+        return model
+    except Exception as e:
+        logger.error(f"Error loading sentence embedding model {model_name}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Could not load sentence embedding model: {model_name}")
+
+def load_autoencoder_model(path: str, embedding_dim: int, encoding_dim: int):
+    """Loads a pre-trained PyTorch Autoencoder model. Caches it."""
+    cache_key = (path, embedding_dim, encoding_dim)
+    if cache_key in loaded_autoencoders_cache:
+        logger.info(f"Using cached autoencoder model: {path}")
+        return loaded_autoencoders_cache[cache_key]
+
+    logger.info(f"Loading autoencoder model from: {path}...")
+    if not os.path.exists(path):
+        logger.error(f"Autoencoder model file not found at: {path}")
+        raise HTTPException(status_code=404, detail=f"Autoencoder model not found at path: {path}")
+    
+    try:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu") # Use GPU if available
+        autoencoder = TextEmbeddingAutoencoder(embedding_dim, encoding_dim).to(device)
+        autoencoder.load_state_dict(torch.load(path, map_location=device))
+        autoencoder.eval() # Set to evaluation mode
+        loaded_autoencoders_cache[cache_key] = autoencoder
+        logger.info(f"Autoencoder model {path} loaded successfully to {device}.")
+        return autoencoder
+    except Exception as e:
+        logger.error(f"Error loading autoencoder model {path}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Could not load autoencoder model: {path}")
+
+
 def get_model_and_tokenizer(model_name: str, task: str, num_labels: Optional[int] = None, quantization: str = "none"):
-    # For text-classification/token-classification, num_labels in cache key is important if different heads are used.
+    # (Content from previous version - no changes here for this feature)
     cache_key_num_labels_suffix = None
     if task == "text-classification" or task == "token-classification":
         cache_key_num_labels_suffix = num_labels
@@ -133,7 +216,7 @@ def get_model_and_tokenizer(model_name: str, task: str, num_labels: Optional[int
         if num_labels is not None:
             logger.info(f"Loading {model_name} for {task} with explicit num_labels: {num_labels}")
             model_args["num_labels"] = num_labels
-            model_args["ignore_mismatched_sizes"] = True # Important if re-initializing head
+            model_args["ignore_mismatched_sizes"] = True 
         else:
             logger.info(f"Loading {model_name} for {task} inference (num_labels will be inferred from model config).")
         
@@ -153,10 +236,9 @@ def get_model_and_tokenizer(model_name: str, task: str, num_labels: Optional[int
     else:
         raise HTTPException(status_code=400, detail=f"Unsupported task for model loading: {task}")
     
-    if model_to_load is None: # Should not happen if logic is correct
+    if model_to_load is None: 
         raise HTTPException(status_code=500, detail=f"Model could not be loaded for task {task}.")
 
-    # Resize embeddings if a new pad token was added and model supports it
     if tokenizer.pad_token_id is not None and \
        hasattr(model_to_load, 'config') and \
        hasattr(model_to_load.config, 'vocab_size') and \
@@ -181,6 +263,7 @@ def get_model_and_tokenizer(model_name: str, task: str, num_labels: Optional[int
     return model_to_load, tokenizer
 
 def get_lora_target_modules(model_name_or_path: str, user_specified_modules: Optional[Union[str, List[str]]]) -> List[str]:
+    # (Content from previous version)
     if isinstance(user_specified_modules, str):
         modules = [m.strip() for m in user_specified_modules.split(",") if m.strip()]
         if modules: return modules
@@ -192,7 +275,6 @@ def get_lora_target_modules(model_name_or_path: str, user_specified_modules: Opt
     if "t5" in name or "bart" in name or "pegasus" in name: 
         return ["q", "v", "k", "o", "wi", "wo"] 
     if "distilbert" in name: return ["q_lin", "k_lin", "v_lin", "out_lin"]
-    # For BERT-like models (BERT, RoBERTa, ELECTRA, etc.), 'query', 'key', 'value' in self-attention, and 'dense' in output/intermediate are common
     if "bert" in name or "roberta" in name or "electra" in name: 
         return ["query", "key", "value", "dense"] 
     if any(n in name for n in ["gpt2", "llama", "mistral", "opt"]):
@@ -205,13 +287,13 @@ def get_lora_target_modules(model_name_or_path: str, user_specified_modules: Opt
 # --- API Endpoints ---
 @app.post("/api/v1/infer", response_model=InferenceResponse)
 async def run_inference_endpoint(request: InferenceRequest):
+    # (Content from previous version - no changes here for this feature)
     logger.info(f"Received inference request: Task={request.task}, Model={request.model_name}")
     try:
         model, tokenizer = get_model_and_tokenizer(
             model_name=request.model_name,
             task=request.task,
             quantization=request.quantization
-            # num_labels is not passed for inference; it's inferred from the pre-trained model's config
         )
 
         predictions = None
@@ -283,7 +365,7 @@ async def run_inference_endpoint(request: InferenceRequest):
         elif request.task == "translation": 
             if not request.input_text:
                 raise HTTPException(status_code=400, detail="Input text is required for translation.")
-            translator = pipeline("translation", model=model, tokenizer=tokenizer, device=-1) # Basic, model name dictates pairs
+            translator = pipeline("translation", model=model, tokenizer=tokenizer, device=-1)
             gen_args = request.generation_args or {}
             if isinstance(request.input_text, str):
                 results = translator(request.input_text, **gen_args)
@@ -294,19 +376,12 @@ async def run_inference_endpoint(request: InferenceRequest):
             else:
                 raise HTTPException(status_code=400, detail="Invalid input_text format for translation.")
         
-        elif request.task == "token-classification": # Added token-classification inference
+        elif request.task == "token-classification":
             if not request.input_text:
                 raise HTTPException(status_code=400, detail="Input text is required for token classification.")
             
-            # The pipeline for token classification is often 'ner' (Named Entity Recognition)
-            # Or more generically 'token-classification'
-            # Grouped_entities=True is a common and useful option for NER.
             token_classifier = pipeline(
-                "ner", # Using "ner" as it's a common use case for token classification
-                model=model, 
-                tokenizer=tokenizer, 
-                device=-1,
-                grouped_entities=True # Consolidates multi-token entities
+                "ner", model=model, tokenizer=tokenizer, device=-1, grouped_entities=True 
             )
             if isinstance(request.input_text, str):
                 predictions = token_classifier(request.input_text)
@@ -314,22 +389,77 @@ async def run_inference_endpoint(request: InferenceRequest):
                 predictions = token_classifier(request.input_text)
             else:
                 raise HTTPException(status_code=400, detail="Invalid input_text format for token classification.")
-
         else:
             raise HTTPException(status_code=400, detail=f"Inference for task '{request.task}' not yet implemented.")
 
         return InferenceResponse(
-            predictions=predictions,
-            model_used=request.model_name,
-            quantization_applied=request.quantization
+            predictions=predictions, model_used=request.model_name, quantization_applied=request.quantization
         )
-
     except Exception as e:
         logger.error(f"Error during inference: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
+
+# --- New Anomaly Detection Endpoint ---
+@app.post("/api/v1/detect_anomaly", response_model=AnomalyDetectionResponse)
+async def detect_text_anomaly(request: AnomalyDetectionRequest):
+    logger.info(f"Received anomaly detection request for text: '{request.text[:50]}...'")
+    logger.info(f"Using embedding model: {request.embedding_model_name}")
+    logger.info(f"Using autoencoder model: {request.autoencoder_model_path}")
+
+    try:
+        # 1. Load Embedding Model
+        embedding_model = get_embedding_model(request.embedding_model_name)
+
+        # 2. Load Autoencoder Model
+        autoencoder = load_autoencoder_model(
+            request.autoencoder_model_path,
+            request.autoencoder_embedding_dim,
+            request.autoencoder_encoding_dim
+        )
+        device = next(autoencoder.parameters()).device # Get device AE is on
+
+        # 3. Generate Embedding for Input Text
+        # SentenceTransformer.encode() returns a numpy array by default.
+        # Convert to list for single text, or list of lists for multiple texts if needed.
+        # For single text:
+        logger.info("Generating text embedding...")
+        input_embedding_np = embedding_model.encode(request.text)
+        input_embedding = torch.tensor(input_embedding_np, dtype=torch.float32).unsqueeze(0).to(device) # Add batch dim and move to device
+
+        # 4. Get Reconstruction from Autoencoder
+        logger.info("Getting reconstruction from autoencoder...")
+        with torch.no_grad():
+            reconstructed_embedding = autoencoder(input_embedding)
+
+        # 5. Calculate Reconstruction Error (MSE)
+        loss_fn = nn.MSELoss()
+        reconstruction_error = loss_fn(reconstructed_embedding, input_embedding).item()
+        logger.info(f"Reconstruction error: {reconstruction_error}")
+
+        # 6. Compare with Threshold
+        is_anomaly = reconstruction_error > request.threshold
+        logger.info(f"Is anomaly: {is_anomaly} (Threshold: {request.threshold})")
+
+        return AnomalyDetectionResponse(
+            text=request.text,
+            is_anomaly=is_anomaly,
+            reconstruction_error=reconstruction_error,
+            threshold_used=request.threshold,
+            embedding_model_used=request.embedding_model_name,
+            autoencoder_model_used=request.autoencoder_model_path
+        )
+
+    except HTTPException: # Re-raise HTTPExceptions from helpers
+        raise
+    except Exception as e:
+        logger.error(f"Error during anomaly detection: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Anomaly detection failed: {str(e)}")
+
+
 @app.post("/api/v1/finetune", response_model=FineTuneResponse)
 async def run_fine_tuning_endpoint(request: FineTuneRequest, background_tasks: BackgroundTasks):
+    # (Content from previous version - no changes here for this feature)
     params = request.fine_tune_params
     logger.info(f"Fine-tune: Task={request.task}, Model={request.model_name}, Data={params.dataset_path}")
     run_name = f"{request.model_name.replace('/', '_')}_{request.task}_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}"
@@ -345,11 +475,11 @@ async def run_fine_tuning_endpoint(request: FineTuneRequest, background_tasks: B
         
         if params.dataset_path.endswith(".csv"):
             df = pd.read_csv(params.dataset_path)
-            required_csv_cols = [params.text_column] # text_column for tokens in token_classification
+            required_csv_cols = [params.text_column]
             if request.task == "text-classification": required_csv_cols.append(params.label_column)
             elif request.task == "question-answering": required_csv_cols.extend([params.context_column, params.label_column])
             elif request.task == "summarization" or request.task == "translation": required_csv_cols.append(params.label_column)
-            elif request.task == "token-classification": required_csv_cols.append(params.label_column) # label_column for NER tags
+            elif request.task == "token-classification": required_csv_cols.append(params.label_column)
             
             for col in required_csv_cols:
                 if col not in df.columns:
@@ -364,7 +494,6 @@ async def run_fine_tuning_endpoint(request: FineTuneRequest, background_tasks: B
         
         max_seq_len, max_target_len = params.max_seq_length, params.max_target_length
 
-        # --- Tokenization functions ---
         def preprocess_seq2seq(examples):
             model_inputs = tokenizer(examples[params.text_column], max_length=max_seq_len, truncation=True, padding="max_length")
             with tokenizer.as_target_tokenizer():
@@ -396,42 +525,26 @@ async def run_fine_tuning_endpoint(request: FineTuneRequest, background_tasks: B
             inputs["start_positions"], inputs["end_positions"] = start_positions, end_positions
             return inputs
 
-        def tokenize_fn_generic(ex): # Used for text-classification
+        def tokenize_fn_generic(ex): 
             if params.text_column not in ex: raise ValueError(f"Text column '{params.text_column}' missing.")
             tk_batch = tokenizer(ex[params.text_column], truncation=True, padding="max_length", max_length=max_seq_len)
             if params.label_column not in ex: raise ValueError(f"Label column '{params.label_column}' missing.")
             tk_batch["labels"] = ex[params.label_column]
             return tk_batch
 
-        # Placeholder for token classification tokenization - this is complex
-        # It requires aligning labels with tokens after WordPiece tokenization.
-        # For a robust solution, refer to Hugging Face examples for token classification.
         def tokenize_and_align_labels_for_ner(examples):
-            # This is a simplified placeholder. Real NER preprocessing is more involved.
-            # Assumes examples[params.text_column] is a list of words
-            # and examples[params.label_column] is a list of corresponding NER tags (integers or strings).
             tokenized_inputs = tokenizer(
-                examples[params.text_column],
-                truncation=True,
-                is_split_into_words=True, # Important for pre-tokenized input
-                padding="max_length",
-                max_length=max_seq_len
+                examples[params.text_column], truncation=True, is_split_into_words=True, 
+                padding="max_length", max_length=max_seq_len
             )
-            # Real label alignment logic is needed here.
-            # For now, just passing dummy labels if the column exists.
-            # This WILL NOT TRAIN A USEFUL NER MODEL without proper label alignment.
             labels = []
             for i, label_list in enumerate(examples[params.label_column]):
                 word_ids = tokenized_inputs.word_ids(batch_index=i)
-                previous_word_idx = None
-                label_ids = []
+                previous_word_idx, label_ids = None, []
                 for word_idx in word_ids:
-                    if word_idx is None: # Special tokens
-                        label_ids.append(-100)
-                    elif word_idx != previous_word_idx: # Only label the first token of a given word
-                        label_ids.append(label_list[word_idx] if isinstance(label_list[word_idx], int) else -100) # Assuming labels are int or need mapping
-                    else: # For sub-tokens of the same word
-                        label_ids.append(-100)
+                    if word_idx is None: label_ids.append(-100)
+                    elif word_idx != previous_word_idx: label_ids.append(label_list[word_idx] if isinstance(label_list[word_idx], int) else -100)
+                    else: label_ids.append(-100)
                     previous_word_idx = word_idx
                 labels.append(label_ids)
             tokenized_inputs["labels"] = labels
@@ -443,29 +556,22 @@ async def run_fine_tuning_endpoint(request: FineTuneRequest, background_tasks: B
         elif request.task == "token-classification":
             logger.warning("Using simplified placeholder for NER tokenization. For effective NER fine-tuning, implement proper label alignment.")
             chosen_tokenize_fn = tokenize_and_align_labels_for_ner 
-            # Ensure your dataset for token-classification has 'tokens' and 'ner_tags' (or similar)
-            # and that text_column points to 'tokens' and label_column to 'ner_tags'
 
         cols_to_remove_for_map = list(raw_datasets[train_split].column_names)
         tokenized_ds = raw_datasets.map(chosen_tokenize_fn, batched=True, remove_columns=cols_to_remove_for_map)
         
-        # Model Loading
-        num_labels_for_task = params.num_labels # For cls or token_cls
+        num_labels_for_task = params.num_labels
         if (request.task == "text-classification" or request.task == "token-classification") and not num_labels_for_task:
             if "labels" not in tokenized_ds[train_split].features: raise HTTPException(status_code=400, detail="'labels' not in tokenized data.")
             labels_feature = tokenized_ds[train_split].features.get("labels")
-            # For token classification, labels are often sequences, so num_classes is on the inner feature
             if request.task == "token-classification" and isinstance(labels_feature, Sequence) and hasattr(labels_feature.feature, "num_classes"):
                 num_labels_for_task = labels_feature.feature.num_classes
             elif hasattr(labels_feature, "num_classes"): 
                 num_labels_for_task = labels_feature.num_classes
-            else: # Fallback: count unique labels (less ideal for token classification if labels are sequences)
-                # This unique counting might not be right for token classification if labels are lists of tags.
-                # For token classification, num_labels is the number of distinct entity types.
+            else: 
                 if request.task == "text-classification":
                     unique_labels_list = tokenized_ds[train_split].unique("labels")
                     if unique_labels_list: num_labels_for_task = len(unique_labels_list)
-                # For token-classification, num_labels should ideally be known from the dataset's config or provided.
             if not num_labels_for_task: raise HTTPException(status_code=400, detail="num_labels needed and not inferable for " + request.task)
             logger.info(f"Inferred num_labels for {request.task}: {num_labels_for_task}")
 
@@ -483,12 +589,11 @@ async def run_fine_tuning_endpoint(request: FineTuneRequest, background_tasks: B
         if tokenizer.pad_token_id is not None and hasattr(base_model, 'resize_token_embeddings') and tokenizer.pad_token_id >= base_model.config.vocab_size:
              base_model.resize_token_embeddings(len(tokenizer))
 
-        # PEFT/LoRA
         peft_model = base_model
         if params.use_lora and params.lora_config:
             lora_c, task_type_peft = params.lora_config, None
             if request.task == "text-classification": task_type_peft = TaskType.SEQ_CLS
-            elif request.task == "token-classification": task_type_peft = TaskType.TOKEN_CLS # Added for Token Classification
+            elif request.task == "token-classification": task_type_peft = TaskType.TOKEN_CLS
             elif request.task == "text-generation": task_type_peft = TaskType.CAUSAL_LM
             elif request.task == "question-answering": task_type_peft = TaskType.QUESTION_ANS
             elif request.task == "summarization" or request.task == "translation": task_type_peft = TaskType.SEQ_2_SEQ_LM
@@ -501,12 +606,11 @@ async def run_fine_tuning_endpoint(request: FineTuneRequest, background_tasks: B
             peft_model = get_peft_model(base_model, peft_config)
             peft_model.print_trainable_parameters()
 
-        # Trainer Setup
         training_args_dict = {
             "output_dir": output_dir, "num_train_epochs": params.epochs,
             "per_device_train_batch_size": params.batch_size, "per_device_eval_batch_size": params.batch_size,
             "learning_rate": params.learning_rate, "weight_decay": 0.01,
-            "logging_dir": f"{output_dir}/logs", "logging_steps": max(1, int(len(tokenized_ds[train_split]) / (params.batch_size * 10))), # Log more frequently
+            "logging_dir": f"{output_dir}/logs", "logging_steps": max(1, int(len(tokenized_ds[train_split]) / (params.batch_size * 10))),
             "evaluation_strategy": "epoch" if eval_split and eval_split in tokenized_ds else "no",
             "save_strategy": "epoch" if eval_split and eval_split in tokenized_ds else "steps",
             "save_total_limit": 2, "load_best_model_at_end": bool(eval_split and eval_split in tokenized_ds),
@@ -516,12 +620,6 @@ async def run_fine_tuning_endpoint(request: FineTuneRequest, background_tasks: B
         training_args = TrainingArguments(**training_args_dict)
         
         data_collator_for_trainer = DataCollatorWithPadding(tokenizer=tokenizer)
-        # from transformers import DataCollatorForTokenClassification # For NER
-        # if request.task == "token-classification":
-        #    data_collator_for_trainer = DataCollatorForTokenClassification(tokenizer=tokenizer)
-        # from transformers import DataCollatorForSeq2Seq 
-        # if request.task in ["summarization", "translation"]:
-        #    data_collator_for_trainer = DataCollatorForSeq2Seq(tokenizer=tokenizer, model=peft_model)
 
         trainer = Trainer(model=peft_model, args=training_args, train_dataset=tokenized_ds[train_split], eval_dataset=tokenized_ds.get(eval_split), tokenizer=tokenizer, data_collator=data_collator_for_trainer)
         
