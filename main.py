@@ -400,57 +400,47 @@ async def run_inference_endpoint(request: InferenceRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# --- New Anomaly Detection Endpoint ---
-@app.post("/api/v1/detect_anomaly", response_model=AnomalyDetectionResponse)
+# --- New Anomaly Detection Endpoint ---z@app.post("/api/v1/detect_anomaly", response_model=AnomalyDetectionResponse)
 async def detect_text_anomaly(request: AnomalyDetectionRequest):
     logger.info(f"Received anomaly detection request for text: '{request.text[:50]}...'")
     logger.info(f"Using embedding model: {request.embedding_model_name}")
     logger.info(f"Using autoencoder model: {request.autoencoder_model_path}")
 
     try:
-        # 1. Load Embedding Model
         embedding_model = get_embedding_model(request.embedding_model_name)
-
-        # 2. Load Autoencoder Model
         autoencoder = load_autoencoder_model(
             request.autoencoder_model_path,
             request.autoencoder_embedding_dim,
             request.autoencoder_encoding_dim
         )
-        device = next(autoencoder.parameters()).device # Get device AE is on
+        device = next(autoencoder.parameters()).device 
 
-        # 3. Generate Embedding for Input Text
-        # SentenceTransformer.encode() returns a numpy array by default.
-        # Convert to list for single text, or list of lists for multiple texts if needed.
-        # For single text:
         logger.info("Generating text embedding...")
         input_embedding_np = embedding_model.encode(request.text)
-        input_embedding = torch.tensor(input_embedding_np, dtype=torch.float32).unsqueeze(0).to(device) # Add batch dim and move to device
+        input_embedding = torch.tensor(input_embedding_np, dtype=torch.float32).unsqueeze(0).to(device) 
 
-        # 4. Get Reconstruction from Autoencoder
         logger.info("Getting reconstruction from autoencoder...")
         with torch.no_grad():
             reconstructed_embedding = autoencoder(input_embedding)
 
-        # 5. Calculate Reconstruction Error (MSE)
         loss_fn = nn.MSELoss()
-        reconstruction_error = loss_fn(reconstructed_embedding, input_embedding).item()
-        logger.info(f"Reconstruction error: {reconstruction_error}")
+        reconstruction_error_tensor = loss_fn(reconstructed_embedding, input_embedding)
+        reconstruction_error_float = float(reconstruction_error_tensor.item()) # Explicit cast to Python float
+        logger.info(f"Reconstruction error: {reconstruction_error_float}")
 
-        # 6. Compare with Threshold
-        is_anomaly = reconstruction_error > request.threshold
+        is_anomaly = reconstruction_error_float > request.threshold
         logger.info(f"Is anomaly: {is_anomaly} (Threshold: {request.threshold})")
 
         return AnomalyDetectionResponse(
             text=request.text,
             is_anomaly=is_anomaly,
-            reconstruction_error=reconstruction_error,
+            reconstruction_error=reconstruction_error_float, # Use the Python float
             threshold_used=request.threshold,
             embedding_model_used=request.embedding_model_name,
             autoencoder_model_used=request.autoencoder_model_path
         )
 
-    except HTTPException: # Re-raise HTTPExceptions from helpers
+    except HTTPException: 
         raise
     except Exception as e:
         logger.error(f"Error during anomaly detection: {e}", exc_info=True)
