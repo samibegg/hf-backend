@@ -118,47 +118,44 @@ loaded_models_cache = {} # Stores { (model_name, quantization_type, task_type_fo
 
 def get_model_and_tokenizer(model_name: str, task: str, num_labels: Optional[int] = None, quantization: str = "none"):
     """Loads model and tokenizer, applying quantization if specified. Caches them."""
-    cache_key = (model_name, quantization, task, num_labels) # num_labels part of key for classification heads
+    # For text-classification, the num_labels in the cache key is important if different heads are used.
+    # For inference, num_labels is usually None, and for fine-tuning it's specified.
+    cache_key = (model_name, quantization, task, num_labels if task == "text-classification" else None)
     if cache_key in loaded_models_cache:
-        logger.info(f"Using cached model and tokenizer for {model_name} ({quantization}, task: {task})")
+        logger.info(f"Using cached model: {model_name} ({quantization}, task: {task}, num_labels for cache key: {cache_key[3]})")
         return loaded_models_cache[cache_key]
 
     logger.info(f"Loading tokenizer for {model_name}...")
     tokenizer = AutoTokenizer.from_pretrained(model_name)
-
     logger.info(f"Loading model {model_name} for task {task}...")
+
     if task == "text-classification":
-        if num_labels is None:
-            # Try to infer from config, or raise error if not possible for fine-tuning
-            # For pre-finetuned models, this is usually set.
-            # config = AutoConfig.from_pretrained(model_name)
-            # num_labels = config.num_labels if hasattr(config, 'num_labels') else 2 # Default or raise
-            logger.warning(f"num_labels not explicitly provided for {model_name} text-classification. It might be inferred if model is already fine-tuned for classification.")
-        model = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=num_labels)
+        if num_labels is not None:
+            # This branch is typically for fine-tuning, where num_labels is explicitly set.
+            logger.info(f"Loading {model_name} for text-classification with explicit num_labels: {num_labels}")
+            model = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=num_labels)
+        else:
+            # This branch is for inference. Let the model load its own config for num_labels.
+            # The warning about num_labels not being provided is more relevant for fine-tuning setup.
+            logger.info(f"Loading {model_name} for text-classification inference (num_labels will be inferred from model config).")
+            model = AutoModelForSequenceClassification.from_pretrained(model_name)
     elif task == "text-generation":
         model = AutoModelForCausalLM.from_pretrained(model_name)
-    # Add other task-specific model loaders here
-    # elif task == "question-answering":
-    #     model = AutoModelForQuestionAnswering.from_pretrained(model_name)
     else:
         raise HTTPException(status_code=400, detail=f"Unsupported task for model loading: {task}")
-
+    
     model.eval() # Set to evaluation mode by default
 
     if quantization == "dynamic_int8_cpu":
-        if not hasattr(torch.quantization, 'quantize_dynamic'):
-             raise HTTPException(status_code=501, detail="Dynamic quantization not available in this PyTorch build.")
+        if not hasattr(torch.quantization, "quantize_dynamic"):
+             raise HTTPException(status_code=501, detail="Dynamic quantization unavailable.")
         logger.info(f"Applying dynamic INT8 quantization to {model_name} for CPU...")
-        # Ensure model is on CPU before quantization if it was loaded on GPU by mistake
         model = model.to("cpu")
-        model = torch.quantization.quantize_dynamic(
-            model, {torch.nn.Linear}, dtype=torch.qint8
-        )
+        model = torch.quantization.quantize_dynamic(model, {torch.nn.Linear}, dtype=torch.qint8)
         logger.info("Dynamic quantization applied.")
     elif quantization != "none":
-        logger.warning(f"Unsupported quantization option '{quantization}' for on-the-fly loading. Using 'none'.")
-
-
+        logger.warning(f"Unsupported quantization: {quantization}. Using none.")
+    
     loaded_models_cache[cache_key] = (model, tokenizer)
     return model, tokenizer
 
