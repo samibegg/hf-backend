@@ -8,42 +8,52 @@ set -e
 
 echo "--- Nginx and Certbot Setup Script for FastAPI ---"
 
-# --- Step 1: Install Nginx and Certbot ---
+# --- Step 0: Get Domain Name from Command Line Argument ---
+if [ -z "$1" ]; then
+    echo "Usage: $0 <your_domain_name>"
+    echo "Error: Domain name not provided as a command-line argument."
+    exit 1
+fi
+DOMAIN_NAME="$1"
+echo "Domain name set to: $DOMAIN_NAME"
+
+# --- Step 1: Install Nginx, Certbot, and UFW ---
 echo "Updating system packages..."
 sudo apt update
 # sudo apt upgrade -y # Optionally run upgrade if desired, can take time
 
-echo "Installing Nginx, Certbot, and Certbot Nginx plugin..."
+echo "Installing Nginx, Certbot, Certbot Nginx plugin, and UFW..."
 sudo apt install -y \
     nginx \
     certbot \
-    python3-certbot-nginx
+    python3-certbot-nginx \
+    ufw # Added UFW installation
 
 # --- Step 2: Configure Firewall (UFW) ---
 echo "Configuring firewall (UFW)..."
+# Check if UFW is active. If not, enable it.
+if ! command -v ufw &> /dev/null
+then
+    echo "UFW command could not be found even after attempting installation. Exiting."
+    exit 1
+fi
+
 if ! sudo ufw status | grep -qw active; then
   echo "UFW is not active. Enabling UFW."
   sudo ufw allow 'OpenSSH' # Ensure SSH access is not blocked BEFORE enabling ufw
-  sudo ufw enable # This will prompt for confirmation if run interactively without a `yes |`
+  # The following command might prompt for confirmation.
+  # To automate, you might use `yes | sudo ufw enable` but that can be risky if not intended.
+  # For a script, it's better to inform the user or handle the prompt if possible.
+  # For now, we assume the user will handle the (y/n) prompt if it appears.
+  sudo ufw enable
 else
   echo "UFW is already active."
 fi
 sudo ufw allow 'Nginx Full' # Allows both HTTP (80) and HTTPS (443)
-sudo ufw allow 'OpenSSH'   # Re-ensure SSH is allowed
+sudo ufw allow 'OpenSSH'   # Re-ensure SSH is allowed if it was enabled for the first time
 sudo ufw status
 
-# --- Step 3: Get Domain Name ---
-read -r -p "Enter your domain name (e.g., api.example.com): " DOMAIN_NAME
-if [ -z "$DOMAIN_NAME" ]; then
-    echo "Domain name cannot be empty. Exiting."
-    exit 1
-fi
-# Optional: Add www variant if desired, Certbot can also handle this.
-# read -r -p "Also configure for www.$DOMAIN_NAME? (y/N): " CONFIGURE_WWW
-# WWW_DOMAIN_NAME_ARG=""
-# if [[ "$CONFIGURE_WWW" =~ ^[Yy]$ ]]; then
-#     WWW_DOMAIN_NAME_ARG="-d www.$DOMAIN_NAME"
-# fi
+# --- Step 3 was Get Domain Name, now handled in Step 0 ---
 
 # --- Step 4: Configure Nginx as a Reverse Proxy ---
 echo "Configuring Nginx for domain: $DOMAIN_NAME..."
@@ -114,7 +124,7 @@ echo "It will also ask if you want to redirect HTTP to HTTPS (recommended)."
 # Using --redirect is generally recommended.
 # Using --non-interactive --agree-tos -m your_email@example.com for full automation is possible but requires email.
 # For now, keeping it interactive for email and TOS.
-sudo certbot --nginx -d "$DOMAIN_NAME" # $WWW_DOMAIN_NAME_ARG (if you implemented www variant above)
+sudo certbot --nginx -d "$DOMAIN_NAME" # Add additional -d flags for www or other SANs if needed
 
 echo "Certbot process finished."
 echo "Verifying Nginx status after Certbot..."
